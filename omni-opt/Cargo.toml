@@ -1,0 +1,23 @@
+[package]
+name = "omni-opt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Pure-Rust, zero-allocation mathematical optimization framework"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["optimization", "numerical", "lbfgs", "no-alloc", "scientific"]
+categories = ["mathematics", "science", "algorithms"]
+
+[features]
+default = []
+# Opt-in blanket impls for `faer::Col<f64>`. Keeps the core crate
+# free of a heavy dense-linalg dependency unless a caller wants it.
+faer = ["dep:faer"]
+
+[dependencies]
+faer = { version = "0.22", optional = true }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
