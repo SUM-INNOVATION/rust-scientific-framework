@@ -20,3 +20,16 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+
+### Rust ###
+# Build artifacts for every crate in the workspace (root + nested)
+target/
+**/target/
+# Backup files from rustfmt etc.
+**/*.rs.bk
+# Lockfile is committed only for binaries; this repo is a library workspace
+# (remove this line if any crate here becomes a binary and you want a pinned build)
+Cargo.lock
+
+### macOS ###
+.DS_Store
