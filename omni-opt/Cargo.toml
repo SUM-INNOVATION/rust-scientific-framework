@@ -18,6 +18,13 @@ faer = ["dep:faer"]
 [dependencies]
 faer = { version = "0.22", optional = true }
 
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "solver_bench"
+harness = false
+
 [lints.rust]
 missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "deny"

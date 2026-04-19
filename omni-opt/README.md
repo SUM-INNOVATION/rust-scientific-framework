@@ -8,7 +8,7 @@ solver is allocation-free.
 
 ## Features
 
-### High-level: unconstrained optimization
+### High-level: unconstrained & box-constrained optimization
 
 - **`Solver` + `SolverBuilder`** — fluent builder, one call to `.build(n)`
   pre-allocates everything; `.run(&mut oracle, &mut x)` then drives the
@@ -21,6 +21,12 @@ solver is allocation-free.
   Alg. 3.5/3.6, safeguarded quadratic zoom) or
   `LineSearch::BacktrackingArmijo`, each with a pre-allocated
   `LineSearchWorkspace`.
+- **`BoxConstraints` + `.bounds(...)` setter** — componentwise
+  `lᵢ ≤ xᵢ ≤ uᵢ` enforced by **projected clipping** after every
+  accepted step. Reduced-gradient stopping criterion under bounds;
+  infeasible `x₀` is silently projected. Deliberately *not* full
+  L-BFGS-B — see limitations note in the
+  [constrained example](#constrained-optimization-projected-clipping).
 - **Structured exits** — `SolverReport { status, iters, f_evals,
   g_evals, f_final, grad_inf_final }`; `status` is a non-allocating
   `TerminationStatus` enum (Converged / MaxIterationsReached /
@@ -135,6 +141,63 @@ Swap `Method::lbfgs()` for `Method::bfgs()`, `Method::steepest_descent()`,
 or (under `--features faer`) `Method::newton()` — the builder rebalances
 the workspace; everything else stays identical.
 
+## Constrained optimization (projected clipping)
+
+Attach componentwise box constraints with a single builder call; the
+solver clips every accepted step onto the feasible region and uses the
+reduced gradient for the convergence test. `x₀` is silently projected,
+so a slightly-infeasible initial guess is fine:
+
+```rust
+use omni_opt::{BoxConstraints, Method, Solver, TerminationStatus};
+# use omni_opt::{Objective, Oracle};
+# struct Q { c: Vec<f64> }
+# impl Objective for Q {
+#     fn n(&self) -> usize { self.c.len() }
+#     fn value(&mut self, x: &[f64]) -> f64 {
+#         0.5 * x.iter().zip(&self.c).map(|(xi,ci)|(xi-ci).powi(2)).sum::<f64>()
+#     }
+# }
+# impl Oracle for Q {
+#     fn value_grad(&mut self, x: &[f64], g: &mut [f64]) -> f64 {
+#         let mut s = 0.0;
+#         for i in 0..x.len() { g[i] = x[i] - self.c[i]; s += g[i] * g[i]; }
+#         0.5 * s
+#     }
+# }
+
+let mut oracle = Q { c: vec![5.0, 5.0] };           // unconstrained optimum
+                                                     //   sits at (5, 5)…
+let bounds = BoxConstraints::uniform(2, -1.0, 1.0); // …but we clamp to the
+                                                     //   box [-1, 1]²
+let mut solver = Solver::builder()
+    .method(Method::lbfgs())
+    .bounds(Some(bounds))
+    .grad_inf_tol(1e-8)
+    .max_iter(50)
+    .build(2);
+
+let mut x = vec![0.0, 0.0];
+let report = solver.run(&mut oracle, &mut x);
+
+assert_eq!(report.status, TerminationStatus::Converged);
+// x == [1.0, 1.0] — pinned at the upper corner of the feasible box.
+```
+
+**Scope & limitations.** This is **projected clipping**, not full
+L-BFGS-B. The iterate is kept feasible at every step, but the solver
+does *not* perform generalized Cauchy-point search, active-set
+identification, or reduced-space curvature updates. Quasi-Newton
+curvature (`BFGS` / `LBFGS`) can therefore degrade mildly when many
+bounds are active; convergence near the boundary may slow accordingly.
+Callers requiring certified first-order optimality under active bounds
+should wait for a future L-BFGS-B milestone.
+
+Unbounded sides are expressed with `f64::INFINITY` /
+`f64::NEG_INFINITY`; `BoxConstraints::upper_only` and
+`BoxConstraints::lower_only` are convenience constructors for the
+common one-sided cases.
+
 ## Dense linear least squares (`faer`)
 
 Solve `A x ≈ b` with `m ≥ n` through column-pivoted QR by default.
@@ -232,13 +295,33 @@ let adapter = CentralDifferenceOracle::with_default_step(MyLoss);
 - No normal-equations path anywhere — orthogonal factorizations only,
   so conditioning is never squared.
 
-## Testing
+## Testing & benchmarking
 
 ```sh
+# Unit + integration tests (incl. the pathology suite).
 cargo test
 cargo test --features faer
+
+# Lint: all targets, all features, denied warnings.
 cargo clippy --all-features --all-targets -- -D warnings
+
+# Dual-axis criterion benches.
+cargo bench --bench solver_bench -- algorithmic   # f-eval counts
+cargo bench --bench solver_bench -- systems       # wall-clock
 ```
+
+The `tests/pathology.rs` suite pins correctness on classical edge
+cases — Rosenbrock (narrow curved valley), badly-scaled anisotropic
+quadratics (κ up to 10⁶), saddle points (descent-direction
+correctness + faer-gated Newton/LM), and noisy central-difference
+gradients (truncation vs. round-off tripwires).
+
+The `benches/solver_bench.rs` binary wires a custom criterion
+`Measurement` that reports **function / gradient evaluation counts**
+with full statistical machinery (mean, stddev, outliers, change
+detection) alongside the standard wall-clock group — so algorithmic
+efficiency and systems performance are isolated on independent axes
+of the same run.
 
 ## License
 

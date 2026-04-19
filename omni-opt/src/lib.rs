@@ -38,6 +38,7 @@
 //! [`central_difference`]: gradient::central_difference
 //! [`CentralDifferenceOracle`]: gradient::CentralDifferenceOracle
 
+pub mod constraints;
 pub mod gradient;
 pub mod kaczmarz;
 pub mod line_search;
@@ -50,6 +51,7 @@ pub mod state;
 pub mod traits;
 pub mod workspace;
 
+pub use constraints::BoxConstraints;
 pub use gradient::{central_difference, CentralDifferenceOracle};
 pub use kaczmarz::{
     KaczmarzConfig, KaczmarzReport, KaczmarzSampling, KaczmarzWorkspace,

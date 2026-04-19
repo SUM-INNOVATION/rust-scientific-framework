@@ -11,6 +11,7 @@
 // still requires indexing the remaining slices by `i`.
 #![allow(clippy::needless_range_loop)]
 
+use crate::constraints::BoxConstraints;
 use crate::line_search::{self, LineSearch, LineSearchConfig, LineSearchError, LineSearchWorkspace};
 use crate::methods::{Method, MethodError, MethodState};
 use crate::oracle::Oracle;
@@ -95,15 +96,17 @@ impl SolverWorkspace {
 // Builder.
 // =============================================================
 
-/// Fluent configuration of a [`Solver`]. Copy-semantics until
-/// [`Self::build`] — the builder holds only small POD fields, so
-/// typos are cheap. Nothing allocates until `build(n)`.
-#[derive(Clone, Copy, Debug)]
+/// Fluent configuration of a [`Solver`]. Cheap to hold — only
+/// POD fields plus an optional owned [`BoxConstraints`]. Every
+/// setter consumes and returns `self` by move, so the absence of
+/// `Copy` costs nothing at call sites.
+#[derive(Clone, Debug)]
 pub struct SolverBuilder {
     method: Method,
     line_search: LineSearch,
     ls_config: LineSearchConfig,
     stopping: StoppingCriteria,
+    bounds: Option<BoxConstraints>,
 }
 
 impl Default for SolverBuilder {
@@ -113,6 +116,7 @@ impl Default for SolverBuilder {
             line_search: LineSearch::StrongWolfe,
             ls_config: LineSearchConfig::default(),
             stopping: StoppingCriteria::default(),
+            bounds: None,
         }
     }
 }
@@ -166,6 +170,22 @@ impl SolverBuilder {
         self
     }
 
+    /// Attach componentwise box constraints.
+    ///
+    /// The solver projects the initial iterate and every
+    /// accepted step onto the feasible box via projected
+    /// clipping. See [`BoxConstraints`] for the scope of the
+    /// guarantee (and the documented gap versus full L-BFGS-B).
+    ///
+    /// Passing `None` clears any previously-attached bounds;
+    /// the builder can therefore be constructed once and reused
+    /// across bounded / unbounded runs.
+    #[must_use]
+    pub fn bounds(mut self, bounds: Option<BoxConstraints>) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
     /// Allocate the solver for problem dimension `n`.
     ///
     /// # Panics
@@ -181,11 +201,21 @@ impl SolverBuilder {
                 && self.ls_config.c2 < 1.0,
             "SolverBuilder::build: require 0 < c1 < c2 < 1"
         );
+        if let Some(b) = &self.bounds {
+            assert_eq!(
+                b.len(),
+                n,
+                "SolverBuilder::build: bounds.len() ({}) != n ({})",
+                b.len(),
+                n
+            );
+        }
         Solver {
             workspace: SolverWorkspace::new(n, self.method),
             line_search: self.line_search,
             ls_config: self.ls_config,
             stopping: self.stopping,
+            bounds: self.bounds,
         }
     }
 }
@@ -205,6 +235,9 @@ pub struct Solver {
     line_search: LineSearch,
     ls_config: LineSearchConfig,
     stopping: StoppingCriteria,
+    /// Optional projected-clipping box constraints. When present,
+    /// `bounds.len() == workspace.n` (enforced at build time).
+    bounds: Option<BoxConstraints>,
 }
 
 impl Solver {
@@ -238,6 +271,7 @@ impl Solver {
             self.line_search,
             &self.ls_config,
             &self.stopping,
+            self.bounds.as_ref(),
             x,
         )
     }
@@ -257,6 +291,7 @@ impl Solver {
             self.line_search,
             &self.ls_config,
             &self.stopping,
+            self.bounds.as_ref(),
             x,
         )
     }
@@ -340,6 +375,7 @@ fn descent_loop<O, D>(
     line_search_kind: LineSearch,
     ls_config: &LineSearchConfig,
     stopping: &StoppingCriteria,
+    bounds: Option<&BoxConstraints>,
     user_x: &mut [f64],
 ) -> SolverReport
 where
@@ -349,6 +385,15 @@ where
     // Seed the internal iterate from the user's buffer. Single
     // memcpy — subsequent iterations never touch user_x.
     ws.x.copy_from_slice(user_x);
+
+    // Silently project `x₀` into the feasible set. Standard
+    // practice in industry solvers (SciPy L-BFGS-B et al.):
+    // rejecting a slightly-infeasible initial guess is
+    // user-hostile, and the projection is O(n) with zero
+    // allocation.
+    if let Some(b) = bounds {
+        b.project_in_place(&mut ws.x);
+    }
 
     // Initial f, ∇f.
     let mut f = oracle.value_grad(&ws.x, &mut ws.g);
@@ -363,7 +408,20 @@ where
 
     while iters < max_iter {
         // --- Convergence check on the current iterate. -----
-        let grad_inf = inf_norm(&ws.g);
+        //
+        // Under bounds the plain gradient can be non-zero at the
+        // true constrained optimum (it points outside the box),
+        // so we test the reduced gradient instead. We overlay it
+        // on the `d` buffer — `d` holds the previous iteration's
+        // direction (or zeros on the first iteration) and is
+        // about to be overwritten by `method.compute_direction`.
+        // Saves `n · 8` bytes versus a dedicated buffer.
+        let grad_inf = if let Some(b) = bounds {
+            b.reduced_gradient(&ws.x, &ws.g, &mut ws.d);
+            inf_norm(&ws.d)
+        } else {
+            inf_norm(&ws.g)
+        };
         if !grad_inf.is_finite() || !f.is_finite() {
             status = TerminationStatus::NumericalFailure;
             break;
@@ -439,7 +497,28 @@ where
             f_evals = f_evals.saturating_add(1);
             g_evals = g_evals.saturating_add(1);
         }
-        let f_new = step.f_new;
+        let mut f_new = step.f_new;
+
+        // --- Projected clipping + conditional gradient refresh ---
+        //
+        // Projected clipping sits between the line-search result
+        // and the stopping-criteria block. `project_in_place`
+        // returns `true` only when a coordinate actually moved;
+        // on iterations where the step landed inside the box we
+        // skip the extra oracle call entirely.
+        //
+        // When a coordinate was clipped, the stored `g_new`
+        // (from the line search, evaluated at the pre-projection
+        // trial point) is now stale. We refresh `f_new` / `g_new`
+        // at the projected iterate so the next direction is
+        // computed from a consistent `(x, ∇f(x))` pair.
+        if let Some(b) = bounds {
+            if b.project_in_place(&mut ws.x_new) {
+                f_new = oracle.value_grad(&ws.x_new, &mut ws.g_new);
+                f_evals = f_evals.saturating_add(1);
+                g_evals = g_evals.saturating_add(1);
+            }
+        }
 
         // --- Stopping-criteria checks on the NEW iterate. ---
         // Step-norm convergence (strong signal: reached minimum).
@@ -694,6 +773,78 @@ mod tests {
     fn report_is_copy_and_carries_counts() {
         fn assert_copy<T: Copy>() {}
         assert_copy::<SolverReport>();
+    }
+
+    // ----- Phase-5 projected-clipping tests -------------------
+
+    #[test]
+    fn bounds_clip_the_optimum_into_the_feasible_box() {
+        // Unconstrained optimum of the shifted quadratic is at
+        // `c = (5, 5)`, but the box [-1, 1]² pins both coordinates
+        // at their upper bound. Reduced gradient at (1, 1) is 0,
+        // so the solver converges on the corner.
+        let mut oracle = ShiftedQuadratic { c: vec![5.0, 5.0] };
+        let bounds = crate::BoxConstraints::uniform(2, -1.0, 1.0);
+        let mut solver = Solver::builder()
+            .method(Method::lbfgs())
+            .bounds(Some(bounds))
+            .grad_inf_tol(1e-8)
+            .max_iter(50)
+            .build(2);
+        let mut x = vec![0.0, 0.0];
+        let r = solver.run(&mut oracle, &mut x);
+        assert_eq!(r.status, TerminationStatus::Converged);
+        assert!((x[0] - 1.0).abs() < 1e-8);
+        assert!((x[1] - 1.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn bounds_unconstrained_optimum_remains_when_inside_box() {
+        // When the unconstrained optimum sits strictly inside the
+        // box, projected clipping is a no-op and we recover the
+        // same answer as the unbounded solver.
+        let mut oracle = ShiftedQuadratic { c: vec![0.25, -0.5] };
+        let bounds = crate::BoxConstraints::uniform(2, -1.0, 1.0);
+        let mut solver = Solver::builder()
+            .method(Method::bfgs())
+            .bounds(Some(bounds))
+            .grad_inf_tol(1e-8)
+            .max_iter(50)
+            .build(2);
+        let mut x = vec![0.9, -0.9]; // start NEAR the boundary
+        let r = solver.run(&mut oracle, &mut x);
+        assert_eq!(r.status, TerminationStatus::Converged);
+        assert!((x[0] - 0.25).abs() < 1e-6);
+        assert!((x[1] - -0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn infeasible_initial_guess_is_silently_projected() {
+        // `x₀ = (100, -100)` starts well outside the box. The
+        // solver must not panic, and the iterate at termination
+        // must be feasible.
+        let mut oracle = ShiftedQuadratic { c: vec![0.0, 0.0] };
+        let bounds = crate::BoxConstraints::uniform(2, -1.0, 1.0);
+        let mut solver = Solver::builder()
+            .method(Method::lbfgs())
+            .bounds(Some(bounds))
+            .grad_inf_tol(1e-8)
+            .max_iter(50)
+            .build(2);
+        let mut x = vec![100.0, -100.0];
+        let r = solver.run(&mut oracle, &mut x);
+        assert_eq!(r.status, TerminationStatus::Converged);
+        assert!(x[0] >= -1.0 - 1e-12 && x[0] <= 1.0 + 1e-12);
+        assert!(x[1] >= -1.0 - 1e-12 && x[1] <= 1.0 + 1e-12);
+    }
+
+    #[test]
+    #[should_panic(expected = "bounds.len()")]
+    fn build_rejects_bounds_of_wrong_dimension() {
+        let bounds = crate::BoxConstraints::uniform(3, -1.0, 1.0);
+        let _ = Solver::builder()
+            .bounds(Some(bounds))
+            .build(2); // mismatch
     }
 
     // ---------- Newton / LM tests (require `faer`) ----------
