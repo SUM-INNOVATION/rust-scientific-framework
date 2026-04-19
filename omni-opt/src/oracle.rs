@@ -57,6 +57,35 @@ pub trait Oracle: Objective {
     fn value_grad(&mut self, x: &[f64], g: &mut [f64]) -> f64;
 }
 
+/// Objective with an analytical Hessian `∇²f(x)`.
+///
+/// Required only by [`crate::Method::Newton`]. Feature-gated
+/// because the only in-crate consumer factors the Hessian via
+/// `faer::linalg::cholesky`; users without the `faer` feature
+/// rely on BFGS / L-BFGS / steepest descent and never see this
+/// trait.
+#[cfg(feature = "faer")]
+pub trait HessianOracle: Oracle {
+    /// Write `∇²f(x)` into `h` as a symmetric `n × n` matrix.
+    ///
+    /// Only the lower triangle needs to be populated — the solver
+    /// factorizes `h` through `Side::Lower` and never reads the
+    /// upper triangle.
+    ///
+    /// # Preconditions
+    ///
+    /// * `x.len() == self.n()`
+    /// * `h.nrows() == h.ncols() == self.n()`
+    ///
+    /// # Zero-allocation contract
+    ///
+    /// `h` is a mutable view into the solver's pre-allocated
+    /// Hessian buffer. Implementors MUST NOT allocate; any
+    /// internal scratch lives on `self` (allocated in the
+    /// constructor).
+    fn hessian(&mut self, x: &[f64], h: faer::MatMut<'_, f64>);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -40,7 +40,9 @@
 
 pub mod gradient;
 pub mod line_search;
+pub mod methods;
 pub mod oracle;
+pub mod solver;
 pub mod state;
 pub mod traits;
 pub mod workspace;
@@ -49,7 +51,11 @@ pub use gradient::{central_difference, CentralDifferenceOracle};
 pub use line_search::{
     LineSearch, LineSearchConfig, LineSearchError, LineSearchStep, LineSearchWorkspace,
 };
+pub use methods::{Method, MethodError};
 pub use oracle::{Objective, Oracle};
+#[cfg(feature = "faer")]
+pub use oracle::HessianOracle;
+pub use solver::{Solver, SolverBuilder, SolverReport};
 pub use state::{StoppingCriteria, TerminationStatus};
 pub use traits::{OmniVec, OmniVecMut, RowAccess};
 pub use workspace::LBFGSWorkspace;
