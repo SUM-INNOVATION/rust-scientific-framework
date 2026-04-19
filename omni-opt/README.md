@@ -5,32 +5,67 @@ a strict **zero-allocation invariant**: every heap allocation happens during
 the builder / constructor phase, and the per-iteration hot loop of every
 solver is allocation-free.
 
-> **Status: pre-1.0.** Phase 1 (this release) ships the abstraction layer —
-> storage-generic traits, pre-allocated workspaces, and structured
-> termination reporting. Solvers (L-BFGS, Kaczmarz, projected gradient, …)
-> land in Phase 2+.
 
 ## Features
 
+### High-level: unconstrained optimization
+
+- **`Solver` + `SolverBuilder`** — fluent builder, one call to `.build(n)`
+  pre-allocates everything; `.run(&mut oracle, &mut x)` then drives the
+  full descent loop with zero heap activity.
+- **`Method` selection** — `SteepestDescent`, `BFGS` (dense rank-2 with
+  curvature safeguard), `LBFGS` (two-loop recursion over the Phase-1
+  ring), and `Newton` with Levenberg–Marquardt damping fallback
+  (`faer` feature).
+- **Line searches** — `LineSearch::StrongWolfe` (Nocedal & Wright
+  Alg. 3.5/3.6, safeguarded quadratic zoom) or
+  `LineSearch::BacktrackingArmijo`, each with a pre-allocated
+  `LineSearchWorkspace`.
+- **Structured exits** — `SolverReport { status, iters, f_evals,
+  g_evals, f_final, grad_inf_final }`; `status` is a non-allocating
+  `TerminationStatus` enum (Converged / MaxIterationsReached /
+  LineSearchFailed / StagnationDetected / NumericalFailure).
+
+### Linear least squares (`faer` feature)
+
+- **`linear::solve`** over dense overdetermined systems `A x ≈ b`
+  (m ≥ n), backed by faer's orthogonal factorizations.
+- **Three backends**: `HouseholderQr` (fastest, full-rank only),
+  `ColPivQr` (rank-revealing, **default**), `Svd` (most robust,
+  rank-deficiency tolerant). **No normal-equations path** — conditioning
+  stays at κ(A), never κ(A)².
+
+### Streaming & row-action
+
+- **`kaczmarz::run`** drives randomized Kaczmarz using only the Phase-1
+  `RowAccess` trait — `A` is never materialized, so dense / CSR / CSC /
+  file-backed / generator-style matrices plug in unchanged.
+- **Row-sampling strategies**: `Uniform`, `SquaredRowNorm`
+  (Strohmer–Vershynin, **default**), `Cyclic`. A deterministic
+  internal xorshift64 RNG makes runs reproducible from `cfg.seed`.
+
+### Oracle & gradient utilities
+
+- **`Objective` / `Oracle`** — minimal evaluation trait, plus a fused
+  `value_grad` entry point that avoids redundant forward passes.
+  `HessianOracle` (`faer` feature) adds `∇²f(x)` for Newton.
+- **`CentralDifferenceOracle<O>`** — one-allocation adapter that
+  promotes any `Objective` to a full `Oracle` via central differences,
+  keeping the solver hot loop allocation-free.
+
+### Low-level primitives (Phase 1)
+
 - **`OmniVec` / `OmniVecMut`** — storage-generic traits over contiguous
   `f64` buffers. Blanket impls for `[f64]`, `&[f64]`, `&mut [f64]`,
-  `Vec<f64>`, and (behind the `faer` feature) `faer::Col<f64>`. Callers
-  bring their own storage; monomorphization collapses each kernel to the
-  same machine code as a hand-written `&[f64]` loop.
-- **`RowAccess`** — streaming row-wise matrix trait for row-action methods
-  (Kaczmarz, coordinate descent, randomized projection). Exposes
-  `row_dot` / `row_sq_norm` / `axpy_row` directly, so dense / CSR / CSC /
-  file-backed providers stay zero-alloc — no row is ever materialized.
-- **`LBFGSWorkspace`** — pre-allocated ring-buffer workspace for the
-  L-BFGS two-loop recursion. Four heap allocations in `new`, zero
-  thereafter. Flat `m · n` row-major layout (no `Vec<Vec<f64>>`) for
-  cache-friendly dot products. A write/commit split lets the solver
-  silently discard a slot on curvature-condition failure without tearing
-  ring state. `n * m` is overflow-checked before any allocation.
+  `Vec<f64>`, and (behind `faer`) `faer::Col<f64>`.
+- **`RowAccess`** — streaming matrix trait (`nrows`, `ncols`,
+  `row_dot`, `row_sq_norm`, `axpy_row`).
+- **`LBFGSWorkspace`** — flat `m × n` ring buffer with `n·m`
+  overflow-checked allocation and a write/commit split that lets the
+  solver silently discard a curvature-violating slot without tearing
+  ring state.
 - **`StoppingCriteria` / `TerminationStatus`** — user-configured
-  tolerances (gradient ∞-norm, step norm, relative function decrease,
-  stagnation window, iteration cap) and a `Copy`, non-allocating exit
-  enum. The termination path itself stays heap-free.
+  tolerances and a `Copy`, heap-free exit enum.
 
 ## Installation
 
@@ -39,7 +74,8 @@ solver is allocation-free.
 omni-opt = "0.1"
 ```
 
-Opt in to `faer::Col<f64>` interoperation:
+Opt in to `faer::Col<f64>` interoperation, Newton/LM, and dense
+orthogonal least squares:
 
 ```toml
 [dependencies]
@@ -48,164 +84,153 @@ omni-opt = { version = "0.1", features = ["faer"] }
 
 **MSRV:** Rust 1.75.
 
-## Usage
+## Quickstart — unconstrained minimization
 
-### Storage-generic kernels with `OmniVec`
-
-Write numerical code once, run it over any supported backend:
+The high-level path. Implement `Oracle`, pick a `Method`, let the
+builder do the allocation:
 
 ```rust
-use omni_opt::OmniVec;
+use omni_opt::{
+    LineSearch, Method, Objective, Oracle, Solver, TerminationStatus,
+};
 
-fn l_inf_norm<V: OmniVec>(v: &V) -> f64 {
-    v.as_slice()
-        .iter()
-        .fold(0.0_f64, |acc, &x| acc.max(x.abs()))
+/// f(x) = ½ ‖x − c‖² ;  ∇f(x) = x − c.
+struct ShiftedQuadratic { c: Vec<f64> }
+
+impl Objective for ShiftedQuadratic {
+    fn n(&self) -> usize { self.c.len() }
+    fn value(&mut self, x: &[f64]) -> f64 {
+        0.5 * x.iter().zip(&self.c).map(|(xi, ci)| (xi - ci).powi(2)).sum::<f64>()
+    }
 }
 
-let owned: Vec<f64>  = vec![1.0, -3.5, 2.0];
-let borrowed: &[f64] = &[-1.0, 0.5, -7.0];
+impl Oracle for ShiftedQuadratic {
+    fn value_grad(&mut self, x: &[f64], g: &mut [f64]) -> f64 {
+        let mut s = 0.0;
+        for i in 0..x.len() {
+            g[i] = x[i] - self.c[i];
+            s   += g[i] * g[i];
+        }
+        0.5 * s
+    }
+}
 
-assert_eq!(l_inf_norm(&owned),    3.5);
-assert_eq!(l_inf_norm(&borrowed), 7.0);
+let mut oracle = ShiftedQuadratic { c: vec![1.0, -2.0, 3.0] };
+
+let mut solver = Solver::builder()
+    .method(Method::lbfgs())                  // L-BFGS (m = 10)
+    .line_search(LineSearch::StrongWolfe)
+    .grad_inf_tol(1e-8)
+    .max_iter(200)
+    .build(3);                                // ←— all heap allocs here
+
+let mut x = vec![0.0; 3];
+let report = solver.run(&mut oracle, &mut x); // ←— zero heap allocs
+
+assert_eq!(report.status, TerminationStatus::Converged);
+// x ≈ [1.0, -2.0, 3.0]
 ```
 
-With the `faer` feature enabled, `faer::Col<f64>` plugs in unchanged:
+Swap `Method::lbfgs()` for `Method::bfgs()`, `Method::steepest_descent()`,
+or (under `--features faer`) `Method::newton()` — the builder rebalances
+the workspace; everything else stays identical.
+
+## Dense linear least squares (`faer`)
+
+Solve `A x ≈ b` with `m ≥ n` through column-pivoted QR by default.
+`A`ᵀ`A` is never formed:
 
 ```rust,ignore
-let col = faer::Col::<f64>::from_fn(3, |i| i as f64 - 1.5);
-let n   = l_inf_norm(&col);
+use faer::Mat;
+use omni_opt::{linear, LinearSolver, LinearSolverWorkspace};
+
+let a: Mat<f64> = /* m × n, m ≥ n */;
+let b: Vec<f64> = /* m        */;
+let mut x       = vec![0.0; a.ncols()];
+
+let mut ws = LinearSolverWorkspace::new(a.nrows(), a.ncols(), LinearSolver::default());
+let report = linear::solve(a.as_ref(), &b, &mut x, &mut ws)?;
+// report.rank, report.residual_norm, report.rank_deficient
 ```
 
-### Streaming rows with `RowAccess`
+Explicit-opt-in alternatives: `LinearSolver::qr()` (full-rank only,
+fastest), `LinearSolver::svd()` (most robust, tolerates near-singular
+matrices).
 
-Implement the three primitives row-action solvers actually need — no row is
-ever materialized as an owned buffer:
+## Streaming Kaczmarz
+
+For massive or out-of-core systems — implement `RowAccess` on your
+storage, and the solver never asks for a full row:
 
 ```rust
-use omni_opt::RowAccess;
+use omni_opt::{kaczmarz, KaczmarzConfig, KaczmarzSampling, KaczmarzWorkspace, RowAccess};
 
-struct DenseRowMajor {
-    nrows: usize,
-    ncols: usize,
-    data:  Vec<f64>, // row-major, length nrows * ncols
-}
+struct DenseRowMajor { nrows: usize, ncols: usize, data: Vec<f64> }
 
 impl RowAccess for DenseRowMajor {
     fn nrows(&self) -> usize { self.nrows }
     fn ncols(&self) -> usize { self.ncols }
 
     fn row_dot(&self, i: usize, x: &[f64]) -> f64 {
-        debug_assert_eq!(x.len(), self.ncols);
-        let row = &self.data[i * self.ncols..(i + 1) * self.ncols];
+        let row = &self.data[i * self.ncols .. (i + 1) * self.ncols];
         row.iter().zip(x).map(|(a, b)| a * b).sum()
     }
 
     fn row_sq_norm(&self, i: usize) -> f64 {
-        let row = &self.data[i * self.ncols..(i + 1) * self.ncols];
+        let row = &self.data[i * self.ncols .. (i + 1) * self.ncols];
         row.iter().map(|a| a * a).sum()
     }
 
     fn axpy_row(&self, i: usize, alpha: f64, y: &mut [f64]) {
-        debug_assert_eq!(y.len(), self.ncols);
-        let row = &self.data[i * self.ncols..(i + 1) * self.ncols];
-        for (y_j, &a) in y.iter_mut().zip(row) {
-            *y_j += alpha * a;
-        }
+        let row = &self.data[i * self.ncols .. (i + 1) * self.ncols];
+        for (yj, &a) in y.iter_mut().zip(row) { *yj += alpha * a; }
     }
 }
+
+let a = DenseRowMajor { /* … */ nrows: 3, ncols: 2, data: vec![1.0,0.0, 0.0,1.0, 1.0,1.0] };
+let b = vec![1.0, 2.0, 3.0];
+let mut x = vec![0.0; 2];
+
+let mut ws = KaczmarzWorkspace::new(a.nrows, a.ncols, KaczmarzSampling::default());
+let report = kaczmarz::run(&KaczmarzConfig::default(), &a, &b, &mut x, &mut ws);
+// report.status, report.epochs, report.iters, report.residual_norm_final
 ```
 
-A CSR provider would implement the same three methods against its own
-`indptr` / `indices` / `values` arrays — unchanged solver code, zero
-allocation.
+`KaczmarzSampling::Uniform` allocates **zero** per-row scratch and is
+the right choice when even `O(m)` row-norm caching is intractable.
+`Cyclic` is deterministic for reproducibility tests.
 
-### Pre-allocated L-BFGS history with `LBFGSWorkspace`
+## Derivative-free objectives
+
+Wrap an `Objective` in `CentralDifferenceOracle` to get a full
+`Oracle` via `2n + 1` value evaluations per gradient, all through a
+single pre-allocated scratch buffer:
 
 ```rust
-use omni_opt::LBFGSWorkspace;
-
-// Allocate ONCE, outside the solver loop.
-let n = 1_000;
-let mut ws = LBFGSWorkspace::new(n, LBFGSWorkspace::DEFAULT_M); // m = 10
-
-// ----- per-iteration hot loop (zero allocation) -----
-let s_new: Vec<f64> = vec![/* x_{k+1} - x_k */ 0.0; n];
-let y_new: Vec<f64> = vec![/* g_{k+1} - g_k */ 0.0; n];
-
-// 1. Fill the next slot.
-ws.head_s_mut().copy_from_slice(&s_new);
-ws.head_y_mut().copy_from_slice(&y_new);
-
-// 2. Curvature check, then commit — or silently drop the slot.
-let ys: f64 = s_new.iter().zip(&y_new).map(|(a, b)| a * b).sum();
-if ys > 0.0 {
-    ws.advance(1.0 / ys);
-}
-// ys <= 0.0: skip `advance`; the half-written slot is discarded
-// and the ring remains intact.
-
-// 3. Read history in the two-loop recursion (0 = oldest valid).
-for k in 0..ws.count() {
-    let _s_k   = ws.s_slot(k);
-    let _y_k   = ws.y_slot(k);
-    let _rho_k = ws.rho_at(k);
-    // ... use ws.alpha_mut() as scratch for the first loop ...
-}
+use omni_opt::{CentralDifferenceOracle, Objective};
+// `MyLoss` implements only `Objective`.
+# struct MyLoss; impl Objective for MyLoss { fn n(&self) -> usize { 0 } fn value(&mut self, _: &[f64]) -> f64 { 0.0 } }
+let adapter = CentralDifferenceOracle::with_default_step(MyLoss);
+// `adapter` now implements `Oracle` — feed it straight into `Solver::run`.
 ```
-
-Key guarantees:
-
-- **Four** heap allocations, all inside `new` (`s`, `y`, `rho`, `alpha`).
-- `n * m` is overflow-checked before any allocation — misconfiguration
-  panics with a named message, never silently wraps.
-- `head_*_mut`, `s_slot`, `y_slot`, `rho_at`, `alpha_mut`, `advance`,
-  and `reset` are all allocation-free.
-
-### Structured termination with `StoppingCriteria` / `TerminationStatus`
-
-```rust
-use omni_opt::{StoppingCriteria, TerminationStatus};
-
-let criteria = StoppingCriteria {
-    grad_inf_tol: 1e-8,
-    ..StoppingCriteria::default() // step_tol=1e-10, rel_f_tol=1e-12,
-                                  // stagnation_window=10, max_iter=1000
-};
-
-fn terminate(
-    grad_inf: f64,
-    iter: usize,
-    c: &StoppingCriteria,
-) -> Option<TerminationStatus> {
-    if !grad_inf.is_finite() {
-        Some(TerminationStatus::NumericalFailure)
-    } else if grad_inf <= c.grad_inf_tol {
-        Some(TerminationStatus::Converged)
-    } else if iter >= c.max_iter {
-        Some(TerminationStatus::MaxIterationsReached)
-    } else {
-        None
-    }
-}
-```
-
-`TerminationStatus` is `Copy` and heap-free — returning it preserves the
-zero-allocation invariant all the way through the exit path.
 
 ## Cargo features
 
-| Feature | Default | Effect                                                               |
-|---------|---------|----------------------------------------------------------------------|
-| `faer`  | off     | Blanket `OmniVec` / `OmniVecMut` impls for `faer::Col<f64>`.         |
+| Feature | Default | Effect                                                                                 |
+|---------|---------|----------------------------------------------------------------------------------------|
+| `faer`  | off     | Adds `faer::Col<f64>` `OmniVec` impls, `HessianOracle`, `Method::Newton`, `linear::*`. |
 
 ## Design guarantees
 
-- Zero heap allocation in the per-iteration hot loop of every solver.
+- Zero heap allocation in the per-iteration hot loop of every solver
+  (descent, line search, linear, Kaczmarz).
 - Heap allocation confined to builder / `new` constructors.
-- Structured, non-panicking termination via enum discriminants.
+- Structured, non-panicking termination via `Copy` enum discriminants.
 - Generic over user-supplied storage — no forced copies.
-- `debug_assert!` preconditions keep release builds branchless.
+- Overflow-checked buffer sizing; `debug_assert!` preconditions keep
+  release builds branchless.
+- No normal-equations path anywhere — orthogonal factorizations only,
+  so conditioning is never squared.
 
 ## Testing
 

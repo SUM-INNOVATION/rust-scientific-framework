@@ -39,7 +39,10 @@
 //! [`CentralDifferenceOracle`]: gradient::CentralDifferenceOracle
 
 pub mod gradient;
+pub mod kaczmarz;
 pub mod line_search;
+#[cfg(feature = "faer")]
+pub mod linear;
 pub mod methods;
 pub mod oracle;
 pub mod solver;
@@ -48,8 +51,15 @@ pub mod traits;
 pub mod workspace;
 
 pub use gradient::{central_difference, CentralDifferenceOracle};
+pub use kaczmarz::{
+    KaczmarzConfig, KaczmarzReport, KaczmarzSampling, KaczmarzWorkspace,
+};
 pub use line_search::{
     LineSearch, LineSearchConfig, LineSearchError, LineSearchStep, LineSearchWorkspace,
+};
+#[cfg(feature = "faer")]
+pub use linear::{
+    LinearSolveError, LinearSolveReport, LinearSolver, LinearSolverWorkspace,
 };
 pub use methods::{Method, MethodError};
 pub use oracle::{Objective, Oracle};
